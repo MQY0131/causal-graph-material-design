@@ -1,0 +1,40 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+import glob
+import os
+
+base_path = r"C:\Users\QQH\Desktop\work\xian"
+
+# 确保 base_path 存在
+if not os.path.exists(base_path):
+    os.makedirs(base_path)
+
+# 设定阈值
+threshold = 50  # 用户可以根据需要调整阈值
+
+# 处理其他图像
+for image_path in glob.glob(os.path.join(base_path, '*.jpg')):
+    image = Image.open(image_path)
+    np_image = np.array(image)
+
+    # 获取图像的高度和宽度
+    height, width, _ = np_image.shape  # 处理三维数组，忽略颜色通道
+
+    # 设定二值化处理的行范围
+    y_min = int(0 * height)  # 可以根据需要调整这个比例
+    y_max = int(0.91 * height)  # 可以根据需要调整这个比例
+
+    # 对指定范围内的行进行二值化处理
+    np_image[y_min:y_max, :] = (np_image[y_min:y_max, :] > threshold) * 255
+
+    # 创建一个用于保存的图像
+    output_image = Image.fromarray(np_image.astype('uint8'))
+
+    # 保存图像的路径修改
+    output_image_path_r = os.path.join(base_path, f'{os.path.splitext(os.path.basename(image_path))[0]}r.tif')  # 新的保存路径，加上'r'
+
+    plot_path = os.path.join(base_path, f'plot_{os.path.splitext(os.path.basename(image_path))[0]}.png')
+
+    output_image.save(output_image_path_r)  # 保存处理后的二值图像
+    # plt.savefig(plot_path)  # 保存图像的可视化结果
