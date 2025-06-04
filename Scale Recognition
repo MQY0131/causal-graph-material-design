@@ -1,0 +1,102 @@
+import os
+import pandas as pd
+import pytesseract
+import cv2
+import numpy as np
+import math
+from PIL import Image
+import re
+import matplotlib.pyplot as plt
+
+# 设置 Tesseract 的路径
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# 获取文件夹中所有图像文件的路径
+directory_path = r"C:\Users\QQH\Desktop\work\xian\real"
+supported_extensions = ('.tif', '.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+file_paths = [os.path.join(directory_path, f) for f in os.listdir(directory_path)
+              if f.lower().endswith(supported_extensions)]
+
+# 创建一个空的 DataFrame 来保存所有图像的结果
+df_results = pd.DataFrame(columns=["图名", "识别的文字", "检测到的线条数", "水平线长度"])
+
+# 遍历每个图像文件
+first_image_processed = False  # 标记第一张图像是否已处理
+
+for i, image_path in enumerate(file_paths):
+    image_name = os.path.basename(image_path)
+    print(f"\n处理图像 {i + 1}/{len(file_paths)}: {image_name}")
+
+    current_result = {
+        "图名": image_name,
+        "识别的文字": "未识别到文字",
+        "检测到的线条数": 0,
+        "水平线长度": ""
+    }
+
+    try:
+        with Image.open(image_path) as img:
+            # 文本识别
+            try:
+                text = pytesseract.image_to_string(img)
+                matches = re.findall(r'Mag=(.*?)\s*X', text)
+                current_result["识别的文字"] = ", ".join(matches) if matches else "没有找到Mag=和X之间的字符"
+            except Exception as e:
+                print(f"文本识别失败: {e}")
+
+            # 转换为OpenCV格式
+            img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            display_img = img_cv.copy()  # 用于显示的图像副本
+
+            # 图像处理
+            height, width, _ = img_cv.shape
+            left_bottom_region = img_cv[height // 2:, :width // 4]
+            gray = cv2.cvtColor(left_bottom_region, cv2.COLOR_BGR2GRAY)
+            _, binary = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)
+            edges = cv2.Canny(binary, 50, 150)
+
+            # 检测线条
+            lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180, threshold=50,
+                                    minLineLength=50, maxLineGap=1)
+
+            line_lengths = []
+            if lines is not None:
+                for line in lines:
+                    x1, y1, x2, y2 = line[0]
+                    if abs(y1 - y2) < 10:  # 水平线
+                        length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+                        line_lengths.append(length)
+
+                        # 在原始图像上绘制红色线条
+                        cv2.line(display_img,
+                                 (x1, y1 + height // 2),  # 调整y坐标
+                                 (x2, y2 + height // 2),  # 调整y坐标
+                                 (0, 0, 255), 2)  # 红色线条
+
+                # 如果是第一张图像，显示所有检测到的红线
+                if not first_image_processed:
+                    plt.figure(figsize=(12, 6))
+                    plt.subplot(121), plt.imshow(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+                    plt.title('原始图像'), plt.axis('off')
+                    plt.subplot(122), plt.imshow(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB))
+                    plt.title(f'检测到的所有水平线（共{len(line_lengths)}条）'), plt.axis('off')
+                    plt.show()
+                    first_image_processed = True  # 标记第一张图像已处理
+
+            current_result.update({
+                "检测到的线条数": len(line_lengths),
+                "水平线长度": ", ".join(f"{l:.2f}" for l in line_lengths)
+            })
+
+    except Exception as e:
+        print(f"处理图像失败: {e}")
+        continue
+
+    df_results = pd.concat([df_results, pd.DataFrame([current_result])], ignore_index=True)
+
+# 保存结果
+output_file = os.path.join(directory_path, 'image_analysis_results.xlsx')
+df_results.to_excel(output_file, index=False)
+
+print(f"\n处理完成! 结果已保存至: {output_file}")
+print(f"成功处理的图像数量: {len(df_results)}/{len(file_paths)}")
