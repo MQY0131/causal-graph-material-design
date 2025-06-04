@@ -1,0 +1,273 @@
+import numpy as np
+import os
+from PIL import Image
+import colorsys
+import cv2
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+# 设定路径
+image_directory = r"C:\Users\QQH\Desktop\work\xian\real"  # 原图路径
+binary_directory = r"C:\Users\QQH\Desktop\work\xian\3"  # 已有二值图路径
+output_excel_path = r"C:\Users\QQH\Desktop\work\xian\2\contour_results.xlsx"  # 轮廓结果Excel输出路径
+analysis_excel_path = r"C:\Users\QQH\Desktop\work\xian\real\image_analysis_results.xlsx"  # 分析结果Excel路径
+summary_excel_path = r"C:\Users\QQH\Desktop\work\xian\2\summary_results.xlsx"  # 新增的分类统计Excel路径
+
+y_min = 0
+y_max = 0.91
+
+# 读取分析结果Excel
+try:
+    analysis_df = pd.read_excel(analysis_excel_path)
+    analysis_data = analysis_df.set_index('figure')['change'].to_dict()
+except Exception as e:
+    print(f"无法读取分析结果Excel文件: {e}")
+    analysis_data = {}
+
+file_paths = [os.path.join(image_directory, f) for f in os.listdir(image_directory) if f.endswith(('.tif', '.jpg'))]
+
+# 创建两个Excel工作簿
+contour_wb = Workbook()
+contour_wb.remove(contour_wb.active)  # 删除默认创建的sheet
+
+summary_wb = Workbook()
+summary_ws = summary_wb.active
+summary_ws.title = "Summary"
+summary_headers = ["Image Name", "Node Area", "Node Black Ratio",
+                   "Gap Area", "Gap Black Ratio",
+                   "Track Area", "Track Black Ratio",
+                   "All Value"]
+summary_ws.append(summary_headers)
+
+
+# 提取轮廓和uv计算部分
+def extract_contours_and_uv(image_path, y_min, y_max, binary_image):
+    """
+    从图片中提取轮廓并计算每个轮廓的u和v值，同时用二值图区域进行计算
+    """
+    try:
+        image = Image.open(image_path)
+        np_image = np.array(image)
+    except Exception as e:
+        print(f"无法读取图像 {image_path}: {e}")
+        return None
+
+    height, width, _ = np_image.shape
+    binary_image = np.array(binary_image)
+
+    # 提取蓝色区域
+    contour_binary = np.zeros((height, width), dtype=np.uint8)
+    for x in range(width):
+        for y in range(int(y_min * height), int(y_max * height)):
+            r, g, b = np_image[y, x]
+            h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+            if 160 / 360 <= h <= 240 / 360 and s > 0.3 and v > 0.2:
+                contour_binary[y, x] = 255
+
+    kernel = np.ones((5, 5), np.uint8)
+    dilated_image = cv2.dilate(contour_binary, kernel, iterations=1)
+
+    contours, hierarchy = cv2.findContours(dilated_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    if hierarchy is None:
+        print("找不到轮廓层次结构，跳过此图")
+        return None
+
+    contours_info = []
+    for idx, contour in enumerate(contours):
+        area = cv2.contourArea(contour)
+        if area < 100 or area > 100000:
+            continue
+
+        M = cv2.moments(contour)
+        if M['m00'] != 0:
+            cX = int(M['m10'] / M['m00'])
+            cY = int(M['m01'] / M['m00'])
+        else:
+            cX, cY = 0, 0
+
+        contour_img = np.zeros((height, width), dtype=np.uint8)
+        cv2.drawContours(contour_img, [contour], -1, 255, thickness=cv2.FILLED)
+
+        # 计算轮廓区域内的黑色像素占比（使用已有二值图）
+        contour_region = cv2.bitwise_and(binary_image, binary_image, mask=contour_img)
+
+        # 计算轮廓区域的黑色像素数量
+        black_pixels = np.sum(contour_region == 0)
+
+        # 计算轮廓区域的所有像素数量（非零像素数）
+        total_pixels = np.sum(contour_img > 0)  # 计算轮廓区域内的所有像素数
+
+        # 确保黑色像素数量小于总像素数量
+        if black_pixels > total_pixels:
+            black_pixels = total_pixels
+
+        # 计算黑色像素占比（不乘以100，直接是一个小于1的比例）
+        black_ratio = black_pixels / total_pixels if total_pixels > 0 else 0
+
+        contours_info.append({
+            "Contour Index": idx,
+            "Area": area,
+            "Center X": cX,
+            "Center Y": cY,
+            "Black Pixel Ratio": black_ratio,
+            "v": 1,  # 行号
+            "u": 1  # 列号
+        })
+
+    # 创建DataFrame
+    contours_df = pd.DataFrame(contours_info)
+    if len(contours_df) == 0:
+        print(f"图片 {image_name} 未检测到有效轮廓")
+        return None
+
+    # 排序
+    contours_df.sort_values(by=["Center Y", "Center X"], ascending=[True, False], inplace=True)
+    contours_df.reset_index(drop=True, inplace=True)
+
+    # 计算 u, v
+    contours_df = calculate_uv(contours_df)
+
+    return contours_df
+
+
+def calculate_uv(contours_df):
+    """
+    计算轮廓的u和v值
+    """
+    # 第一次遍历：计算最大u值
+    max_u = 1
+    current_u = 1
+    for i in range(1, len(contours_df)):
+        prev_x = contours_df.at[i - 1, "Center X"]
+        curr_x = contours_df.at[i, "Center X"]
+        if curr_x > prev_x:  # x回退，换行
+            max_u = max(max_u, current_u)
+            current_u = 1
+        else:
+            current_u += 1
+    max_u = max(max_u, current_u)  # 最后一行
+
+    # 改进的行列分配逻辑：确保每行轮廓数符合max_u要求
+    current_row = 1
+    current_col = 1
+    row_start_index = 0
+
+    for i in range(1, len(contours_df)):
+        prev_x = contours_df.at[i - 1, "Center X"]
+        curr_x = contours_df.at[i, "Center X"]
+
+        if curr_x > prev_x or current_col > max_u:  # x回退或当前行已满，需要换行
+            current_row += 1
+            current_col = 1
+            row_start_index = i
+        else:
+            current_col += 1
+
+        contours_df.at[i, "v"] = current_row
+        contours_df.at[i, "u"] = current_col
+
+    # 确保每行的u从1开始连续编号
+    for row in contours_df["v"].unique():
+        row_indices = contours_df[contours_df["v"] == row].index
+        contours_df.loc[row_indices, "u"] = range(1, len(row_indices) + 1)
+
+    return contours_df
+
+
+# 分类统计计算函数
+def calculate_classification_statistics(contours_df, analysis_data, image_name):
+    """
+    计算节点、间隙和轨迹的统计数据
+    """
+    node_mask = (contours_df["u"] % 2 == 1) & (contours_df["v"] % 2 == 1)
+    gap_mask = (contours_df["u"] % 2 == 0) & (contours_df["v"] % 2 == 0)
+    track_mask = ((contours_df["u"] % 2 == 1) & (contours_df["v"] % 2 == 0)) | \
+                 ((contours_df["u"] % 2 == 0) & (contours_df["v"] % 2 == 1))
+
+    node_area = contours_df[node_mask]["Area"].mean()
+    node_black = contours_df[node_mask]["Black Pixel Ratio"].mean()
+
+    gap_area = contours_df[gap_mask]["Area"].mean()
+    gap_black = contours_df[gap_mask]["Black Pixel Ratio"].mean()
+
+    track_area = contours_df[track_mask]["Area"].mean()
+    track_black = contours_df[track_mask]["Black Pixel Ratio"].mean()
+
+    # 获取对应的change值
+    change_factor = analysis_data.get(image_name, 1.0)
+
+    # 计算track面积（乘以change值）
+    adjusted_track_area = track_area * change_factor if not np.isnan(track_area) else 0
+
+    # 计算all值
+    if not (np.isnan(node_area) or np.isnan(gap_area) or np.isnan(adjusted_track_area)):
+        total_area = node_area + gap_area + adjusted_track_area
+        all_value = (node_area * node_black + gap_area * gap_black + adjusted_track_area * track_black) / total_area
+    else:
+        all_value = 0
+
+    return node_area, node_black, gap_area, gap_black, adjusted_track_area, track_black, all_value
+
+
+# 主处理循环
+for image_path in file_paths:
+    image_name = os.path.basename(image_path)
+    print(f"处理图片: {image_name}")
+
+    # 读取对应的二值图
+    binary_image_path = os.path.join(binary_directory, image_name)
+    if not os.path.exists(binary_image_path):
+        print(f"找不到对应的二值图: {binary_image_path}")
+        continue
+
+    try:
+        binary_img = Image.open(binary_image_path).convert('L')  # 转换为灰度图
+        binary_img = np.array(binary_img)  # 转换为numpy数组
+    except Exception as e:
+        print(f"读取二值图失败: {binary_image_path}, 错误: {e}")
+        continue
+
+    # 提取轮廓和计算u,v
+    contours_df = extract_contours_and_uv(image_path, y_min, y_max, binary_img)
+    if contours_df is None:
+        continue
+
+    # 创建Excel sheet
+    sheet_name = os.path.splitext(image_name)[0][:30]  # 限制sheet名称长度
+    ws = contour_wb.create_sheet(title=sheet_name)
+
+    # 选择要输出的列
+    output_columns = ["Contour Index", "Area", "Center X", "Center Y", "Black Pixel Ratio", "v", "u"]
+    output_df = contours_df[output_columns]
+
+    # 写入数据
+    for r in dataframe_to_rows(output_df, index=False, header=True):
+        ws.append(r)
+
+    print(f"图片 {image_name} 处理完成，已保存到sheet: {sheet_name}")
+
+    # 计算分类统计数据
+    node_area, node_black, gap_area, gap_black, adjusted_track_area, track_black, all_value = \
+        calculate_classification_statistics(contours_df, analysis_data, image_name)
+
+    # 写入汇总数据
+    summary_data = [
+        image_name,
+        node_area if not np.isnan(node_area) else 0,
+        node_black if not np.isnan(node_black) else 0,
+        gap_area if not np.isnan(gap_area) else 0,
+        gap_black if not np.isnan(gap_black) else 0,
+        adjusted_track_area,
+        track_black if not np.isnan(track_black) else 0,
+        all_value
+    ]
+    summary_ws.append(summary_data)
+
+# 保存Excel文件
+contour_wb.save(output_excel_path)
+summary_wb.save(summary_excel_path)
+
+print(f"所有图片处理完成，轮廓结果已保存到 {output_excel_path}")
+print(f"分类统计结果已保存到 {summary_excel_path}")
