@@ -6,13 +6,17 @@ import cv2
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
+from sklearn.cluster import KMeans
+
+# 设置环境变量以避免KMeans内存泄漏问题
+os.environ['OMP_NUM_THREADS'] = '1'
 
 # 设定路径
 image_directory = r"C:\Users\QQH\Desktop\work\xian\real"  # 原图路径
-binary_directory = r"C:\Users\QQH\Desktop\work\xian\3"  # 已有二值图路径
-output_excel_path = r"C:\Users\QQH\Desktop\work\xian\2\contour_results.xlsx"  # 轮廓结果Excel输出路径
+binary_directory = r"C:\Users\QQH\Desktop\work\xian\caled"  # 已有二值图路径
+output_excel_path = r"C:\Users\QQH\Desktop\work\xian\caled\contour_results.xlsx"  # 轮廓结果Excel输出路径
 analysis_excel_path = r"C:\Users\QQH\Desktop\work\xian\real\image_analysis_results.xlsx"  # 分析结果Excel路径
-summary_excel_path = r"C:\Users\QQH\Desktop\work\xian\2\summary_results.xlsx"  # 新增的分类统计Excel路径
+summary_excel_path = r"C:\Users\QQH\Desktop\work\xian\caled\summary_results.xlsx"  # 新增的分类统计Excel路径
 
 y_min = 0
 y_max = 0.91
@@ -96,15 +100,15 @@ def extract_contours_and_uv(image_path, y_min, y_max, binary_image):
         # 计算轮廓区域的黑色像素数量
         black_pixels = np.sum(contour_region == 0)
 
-        # 计算轮廓区域的所有像素数量（非零像素数）
-        total_pixels = np.sum(contour_img > 0)  # 计算轮廓区域内的所有像素数
+        # 计算轮廓区域的所有像素数量（包括黑色和非黑色）
+        total_pixels = contour_region.size  # 直接获取轮廓区域的总像素数量
 
         # 确保黑色像素数量小于总像素数量
         if black_pixels > total_pixels:
             black_pixels = total_pixels
 
-        # 计算黑色像素占比（不乘以100，直接是一个小于1的比例）
-        black_ratio = black_pixels / total_pixels if total_pixels > 0 else 0
+        # 计算黑色像素占比
+        black_ratio = 1 - black_pixels / total_pixels if total_pixels > 0 else 0
 
         contours_info.append({
             "Contour Index": idx,
@@ -134,46 +138,60 @@ def extract_contours_and_uv(image_path, y_min, y_max, binary_image):
 
 def calculate_uv(contours_df):
     """
-    计算轮廓的u和v值
+    为网格点计算行列索引 (u, v)，并直接添加到输入的DataFrame
+    初始v为1，按顺序计算Center Y的差值，如果差值大于上一个差值的4倍，则从此点开始v改为v+1
+    v值相同的点按Center X排序，u值从1开始依次增加
+    新加入判断规则：如果y差值大于25或x差值大于550，则v值增加
     """
-    # 第一次遍历：计算最大u值
-    max_u = 1
-    current_u = 1
-    for i in range(1, len(contours_df)):
-        prev_x = contours_df.at[i - 1, "Center X"]
-        curr_x = contours_df.at[i, "Center X"]
-        if curr_x > prev_x:  # x回退，换行
-            max_u = max(max_u, current_u)
-            current_u = 1
-        else:
-            current_u += 1
-    max_u = max(max_u, current_u)  # 最后一行
+    # 修复列名：使用带空格的列名（实际列名）
+    if 'Center X' not in contours_df.columns or 'Center Y' not in contours_df.columns:
+        raise ValueError("输入DataFrame必须包含'Center X'和'Center Y'列")
 
-    # 改进的行列分配逻辑：确保每行轮廓数符合max_u要求
-    current_row = 1
-    current_col = 1
-    row_start_index = 0
+    # 直接操作输入的DataFrame，添加新列
+    points = contours_df[['Center X', 'Center Y']].values
+    n_points = len(points)
 
-    for i in range(1, len(contours_df)):
-        prev_x = contours_df.at[i - 1, "Center X"]
-        curr_x = contours_df.at[i, "Center X"]
+    # 处理特殊情况
+    if n_points <= 1:
+        contours_df['u'] = 1
+        contours_df['v'] = 1
+        return contours_df
 
-        if curr_x > prev_x or current_col > max_u:  # x回退或当前行已满，需要换行
-            current_row += 1
-            current_col = 1
-            row_start_index = i
-        else:
-            current_col += 1
+    # 按Center Y进行排序
+    contours_df.sort_values(by='Center Y', inplace=True)
 
-        contours_df.at[i, "v"] = current_row
-        contours_df.at[i, "u"] = current_col
+    # 初始化 v 列
+    contours_df['v'] = 1
+    last_y_diff = 0  # 上一个y值差异
+    last_x_diff = 0  # 上一个x值差异
 
-    # 确保每行的u从1开始连续编号
-    for row in contours_df["v"].unique():
-        row_indices = contours_df[contours_df["v"] == row].index
-        contours_df.loc[row_indices, "u"] = range(1, len(row_indices) + 1)
+    # 按Center Y和Center X的差值判断是否需要改变v
+    for i in range(1, n_points):
+        y_diff = contours_df.iloc[i]['Center Y'] - contours_df.iloc[i - 1]['Center Y']
+        x_diff = contours_df.iloc[i]['Center X'] - contours_df.iloc[i - 1]['Center X']
+
+        # 判断y差值大于25或x差值大于550，改变v值
+        if y_diff >= 20:
+            contours_df.loc[contours_df.index[i:], 'v'] += 1  # 从当前点开始v值增加
+
+        last_y_diff = y_diff
+        last_x_diff = x_diff
+
+    # 按照v值分组并按Center X排序，给u赋值
+    contours_df['u'] = 0  # 初始化u值
+
+    for v_value in contours_df['v'].unique():
+        v_group = contours_df[contours_df['v'] == v_value]
+        v_group_sorted = v_group.sort_values(by='Center X')
+
+        # 给当前v组分配u值
+        v_group_sorted['u'] = np.arange(1, len(v_group_sorted) + 1)
+
+        # 更新到原DataFrame
+        contours_df.update(v_group_sorted)
 
     return contours_df
+
 
 
 # 分类统计计算函数
@@ -233,6 +251,38 @@ for image_path in file_paths:
     contours_df = extract_contours_and_uv(image_path, y_min, y_max, binary_img)
     if contours_df is None:
         continue
+
+    # —— 1. 将二值图转换为三通道（BGR）图像 ——
+    bin_bgr = cv2.cvtColor(binary_img, cv2.COLOR_GRAY2BGR)
+
+    # —— 2. 遍历 contours_df，在每个 (Center X, Center Y) 位置绘制 "(u,v)" ——
+    for _, row in contours_df.iterrows():
+        cX = int(row["Center X"])
+        cY = int(row["Center Y"])
+        u_value = int(row["u"])
+        v_value = int(row["v"])
+        uv_text = f"({u_value},{v_value})"
+
+        # 计算偏移后的位置（向左偏移10像素）
+        text_x = cX - 20  # 向左偏移10像素
+        text_y = cY  # Y坐标保持不变
+
+        cv2.putText(
+            bin_bgr,  # 绘制在 BGR 图像上
+            uv_text,
+            (text_x, text_y),  # 使用偏移后的坐标
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,  # 字体大小
+            (0, 0, 255),  # 红色，BGR 格式
+            1,  # 文字粗细
+            cv2.LINE_AA
+        )
+
+    # —— 3. 生成带 'r' 后缀的输出文件名，并保存 ——
+    root, ext = os.path.splitext(binary_image_path)
+    new_binary_path = f"{root}r{ext}"
+    Image.fromarray(bin_bgr).save(new_binary_path)  # 保存为 BGR 图像
+    print(f"已保存标注后的二值图: {new_binary_path}")
 
     # 创建Excel sheet
     sheet_name = os.path.splitext(image_name)[0][:30]  # 限制sheet名称长度
